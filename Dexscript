@@ -1,0 +1,1254 @@
+--[[
+    DEXED v2
+    Dex Explorer | Remote Events Spy | AI Chat (Pollinations/OpenRouter/Groq free)
+    Delta Sync | Copy + Execute on every AI-generated script
+    Executor: Universal (Delta, Synapse, Fluxus, KRNL, Wave)
+    Luau / Roblox Executor Context
+]]
+
+-- ══ Services ══════════════════════════════════════════════════════
+local Players        = game:GetService("Players")
+local UserInputSvc   = game:GetService("UserInputService")
+local HttpSvc        = game:GetService("HttpService")
+local LocalPlayer    = Players.LocalPlayer
+
+-- ══ Executor Abstractions ══════════════════════════════════════════
+local function httpRequest(opts)
+    if syn and syn.request       then return syn.request(opts)
+    elseif request               then return request(opts)
+    elseif http_request          then return http_request(opts)
+    elseif fluxus and fluxus.request then return fluxus.request(opts)
+    else error("No HTTP function available in this executor.") end
+end
+
+local function writeFile(path, data)
+    if writefile then writefile(path, data) end
+end
+
+local function readFile(path)
+    if readfile then
+        local ok, v = pcall(readfile, path)
+        return ok and v or nil
+    end
+end
+
+local function makeDir(path)
+    if makefolder and not (isfolder and isfolder(path)) then
+        pcall(makefolder, path)
+    end
+end
+
+local function copyToClipboard(text)
+    if setclipboard      then setclipboard(text)
+    elseif toclipboard   then toclipboard(text) end
+end
+
+-- ══ Delta Sync ════════════════════════════════════════════════════
+local DeltaSync = { Folder = "DEXED_Sync", Log = {} }
+
+function DeltaSync:Init()
+    makeDir(self.Folder)
+end
+
+function DeltaSync:Push(name, code)
+    local path = self.Folder .. "/" .. name:gsub("%.lua$","") .. ".lua"
+    local ok, err = pcall(writeFile, path, code)
+    if ok then
+        table.insert(self.Log, 1, {op="push", path=path, t=os.time()})
+        return true, path
+    end
+    return false, tostring(err)
+end
+
+function DeltaSync:Pull(name)
+    return readFile(self.Folder .. "/" .. name:gsub("%.lua$","") .. ".lua")
+end
+
+-- ══ Remote Spy ════════════════════════════════════════════════════
+local RemoteSpy = {
+    Active    = false,
+    Log       = {},
+    MaxLog    = 500,
+    Callbacks = {},
+    _orig     = nil,
+}
+
+function RemoteSpy:Start()
+    if self.Active then return end
+    self.Active = true
+    local mt   = getrawmetatable(game)
+    local orig = mt.__namecall
+    self._orig = orig
+    setreadonly(mt, false)
+    mt.__namecall = newcclosure(function(obj, ...)
+        local method = getnamecallmethod()
+        local args   = {...}
+        if (method == "FireServer"   and obj:IsA("RemoteEvent")) or
+           (method == "InvokeServer" and obj:IsA("RemoteFunction")) then
+            local entry = {
+                rtype  = obj.ClassName,
+                name   = obj.Name,
+                path   = obj:GetFullName(),
+                args   = args,
+                t      = os.clock(),
+                obj    = obj,
+            }
+            table.insert(self.Log, 1, entry)
+            if #self.Log > self.MaxLog then table.remove(self.Log) end
+            for _, cb in ipairs(self.Callbacks) do pcall(cb, entry) end
+        end
+        return orig(obj, ...)
+    end)
+    setreadonly(mt, true)
+end
+
+function RemoteSpy:Stop()
+    if not self.Active then return end
+    local mt = getrawmetatable(game)
+    setreadonly(mt, false)
+    mt.__namecall = self._orig
+    setreadonly(mt, true)
+    self.Active = false
+end
+
+function RemoteSpy:Clear()
+    self.Log = {}
+end
+
+function RemoteSpy:BuildScript(entry)
+    local parts = {}
+    for _, arg in ipairs(entry.args) do
+        local t = type(arg)
+        if     t == "string"  then table.insert(parts, string.format("%q", arg))
+        elseif t == "number" or t == "boolean" then table.insert(parts, tostring(arg))
+        elseif t == "table"   then
+            local ok, json = pcall(HttpSvc.JSONEncode, HttpSvc, arg)
+            table.insert(parts, ok and json or "-- [table]")
+        elseif typeof(arg) == "Instance" then
+            table.insert(parts, string.format('game:GetService("%s"):WaitForChild("%s")',
+                arg.ClassName, arg.Name))
+        else
+            table.insert(parts, "-- [" .. typeof(arg) .. "]")
+        end
+    end
+    local argStr = table.concat(parts, ", ")
+    local svc    = entry.path:match("^([^.]+)")
+    local remote = string.format(
+        'game:GetService("%s"):WaitForChild("%s")',
+        svc or "ReplicatedStorage", entry.name
+    )
+    if entry.rtype == "RemoteEvent" then
+        return string.format("%s:FireServer(%s)", remote, argStr)
+    else
+        return string.format('local result = %s:InvokeServer(%s)\nprint(result)', remote, argStr)
+    end
+end
+
+-- ══ AI Chat ═══════════════════════════════════════════════════════
+local AI = {
+    Provider = "pollinations",  -- "pollinations" | "openrouter" | "groq"
+    APIKey   = "",
+    Model    = "openai",        -- pollinations default
+    History  = {},
+    System   = [[You are a Roblox Luau scripting expert for executor context.
+When writing code, always use ```lua code blocks.
+Scripts must be executor-compatible. Use game services correctly.
+Never use wait() — use task.wait(). Keep scripts concise and functional.]],
+}
+
+function AI:Send(userMsg, callback)
+    table.insert(self.History, {role="user", content=userMsg})
+    local msgs = {{role="system", content=self.System}}
+    for _, m in ipairs(self.History) do table.insert(msgs, m) end
+
+    local url, headers, body
+
+    if self.Provider == "pollinations" then
+        url     = "https://text.pollinations.ai/openai"
+        headers = {["Content-Type"]="application/json"}
+        body    = HttpSvc:JSONEncode({
+            model    = "openai",
+            messages = msgs,
+            seed     = math.random(1, 99999),
+        })
+    elseif self.Provider == "openrouter" then
+        url     = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            ["Content-Type"]  = "application/json",
+            ["Authorization"] = "Bearer " .. self.APIKey,
+            ["HTTP-Referer"]  = "https://roblox.com",
+            ["X-Title"]       = "DEXED",
+        }
+        body = HttpSvc:JSONEncode({
+            model    = (self.Model ~= "" and self.Model or "deepseek/deepseek-r1:free"),
+            messages = msgs,
+        })
+    elseif self.Provider == "groq" then
+        url     = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            ["Content-Type"]  = "application/json",
+            ["Authorization"] = "Bearer " .. self.APIKey,
+        }
+        body = HttpSvc:JSONEncode({
+            model    = (self.Model ~= "" and self.Model or "llama-3.3-70b-versatile"),
+            messages = msgs,
+        })
+    end
+
+    task.spawn(function()
+        local ok, resp = pcall(httpRequest, {
+            Url = url, Method = "POST", Headers = headers, Body = body,
+        })
+        if not ok then
+            callback(nil, "HTTP: " .. tostring(resp)); return
+        end
+        local dok, parsed = pcall(HttpSvc.JSONDecode, HttpSvc, resp.Body)
+        if not dok then
+            callback(nil, "JSON: " .. tostring(parsed)); return
+        end
+        if parsed.error then
+            callback(nil, "API: " .. (parsed.error.message or "unknown")); return
+        end
+        local reply = parsed.choices
+            and parsed.choices[1]
+            and parsed.choices[1].message
+            and parsed.choices[1].message.content
+        if not reply then callback(nil, "Empty response"); return end
+        table.insert(self.History, {role="assistant", content=reply})
+        callback(reply, nil)
+    end)
+end
+
+function AI:ParseBlocks(text)
+    -- returns list of {kind="text"|"code", content="..."}
+    local blocks = {}
+    local pos = 1
+    while pos <= #text do
+        local cs, lang_end = text:find("```[^\n]*\n", pos)
+        if not cs then
+            local chunk = text:sub(pos)
+            if chunk:match("%S") then table.insert(blocks,{kind="text",content=chunk}) end
+            break
+        end
+        if cs > pos then
+            local before = text:sub(pos, cs-1)
+            if before:match("%S") then table.insert(blocks,{kind="text",content=before}) end
+        end
+        local ce = text:find("```", lang_end+1)
+        if ce then
+            table.insert(blocks,{kind="code",content=text:sub(lang_end+1, ce-1)})
+            pos = ce + 3
+        else
+            table.insert(blocks,{kind="code",content=text:sub(lang_end+1)})
+            break
+        end
+    end
+    return blocks
+end
+
+-- ══ GUI ═══════════════════════════════════════════════════════════
+local Th = {
+    Bg        = Color3.fromRGB(13, 13, 18),
+    Panel     = Color3.fromRGB(20, 20, 28),
+    Header    = Color3.fromRGB(28, 28, 40),
+    Accent    = Color3.fromRGB(88, 101, 242),
+    AccentDim = Color3.fromRGB(55, 65, 170),
+    Text      = Color3.fromRGB(220, 220, 235),
+    Sub       = Color3.fromRGB(130, 130, 155),
+    Border    = Color3.fromRGB(40, 40, 58),
+    Ok        = Color3.fromRGB(87, 242, 135),
+    Warn      = Color3.fromRGB(254, 231, 92),
+    Err       = Color3.fromRGB(237, 66, 69),
+    CodeBg    = Color3.fromRGB(16, 16, 24),
+    Row1      = Color3.fromRGB(24, 24, 34),
+    Row2      = Color3.fromRGB(30, 30, 42),
+}
+
+local function mk(cls, props, par)
+    local o = Instance.new(cls)
+    for k,v in pairs(props or {}) do o[k]=v end
+    if par then o.Parent = par end
+    return o
+end
+local function rnd(p,r) mk("UICorner",{CornerRadius=UDim.new(0,r or 6)},p) end
+local function brd(p,c,t) mk("UIStroke",{Color=c or Th.Border,Thickness=t or 1},p) end
+local function pad(p,a,b,c,d)
+    mk("UIPadding",{
+        PaddingTop=UDim.new(0,a or 8), PaddingRight=UDim.new(0,b or 8),
+        PaddingBottom=UDim.new(0,c or 8), PaddingLeft=UDim.new(0,d or 8),
+    }, p)
+end
+local function list(p, dir, sp, ha, va)
+    return mk("UIListLayout",{
+        FillDirection = dir or Enum.FillDirection.Vertical,
+        Padding       = UDim.new(0, sp or 0),
+        SortOrder     = Enum.SortOrder.LayoutOrder,
+        HorizontalAlignment = ha or Enum.HorizontalAlignment.Left,
+        VerticalAlignment   = va or Enum.VerticalAlignment.Top,
+    }, p)
+end
+
+-- ScreenGui
+local Gui = mk("ScreenGui",{
+    Name="DEXED_v2", ResetOnSpawn=false,
+    ZIndexBehavior=Enum.ZIndexBehavior.Sibling, IgnoreGuiInset=true,
+})
+do
+    local ok = pcall(function()
+        if syn and syn.protect_gui then syn.protect_gui(Gui) end
+        Gui.Parent = game.CoreGui
+    end)
+    if not ok then
+        pcall(function() Gui.Parent = gethui() end)
+    end
+    if not Gui.Parent then Gui.Parent = LocalPlayer.PlayerGui end
+end
+
+-- Root frame
+local Root = mk("Frame",{
+    Size=UDim2.new(0,840,0,570),
+    Position=UDim2.new(0.5,-420,0.5,-285),
+    BackgroundColor3=Th.Bg, BorderSizePixel=0, ClipsDescendants=true,
+}, Gui)
+rnd(Root,10); brd(Root)
+
+-- ── Titlebar ──────────────────────────────────────────────────────
+local Titlebar = mk("Frame",{
+    Size=UDim2.new(1,0,0,38), BackgroundColor3=Th.Header, BorderSizePixel=0,
+}, Root)
+rnd(Titlebar, 10)
+mk("Frame",{Size=UDim2.new(1,0,0.5,0),Position=UDim2.new(0,0,0.5,0),
+    BackgroundColor3=Th.Header, BorderSizePixel=0}, Titlebar)
+
+mk("TextLabel",{
+    Text="⬡  DEXED  v2", Font=Enum.Font.GothamBold, TextSize=14,
+    TextColor3=Th.Text, BackgroundTransparency=1,
+    Size=UDim2.new(0,180,1,0), TextXAlignment=Enum.TextXAlignment.Left,
+}, Titlebar).Position = UDim2.new(0,12,0,0)
+
+local SpyDot = mk("Frame",{
+    Size=UDim2.new(0,8,0,8), Position=UDim2.new(0,190,0.5,-4),
+    BackgroundColor3=Th.Sub, BorderSizePixel=0,
+}, Titlebar); rnd(SpyDot,4)
+
+local SpyDotLbl = mk("TextLabel",{
+    Text="IDLE", Font=Enum.Font.GothamBold, TextSize=10,
+    TextColor3=Th.Sub, BackgroundTransparency=1,
+    Size=UDim2.new(0,50,1,0), Position=UDim2.new(0,202,0,0),
+    TextXAlignment=Enum.TextXAlignment.Left,
+}, Titlebar)
+
+local function winBtn(txt, col, xpos)
+    local b = mk("TextButton",{
+        Text=txt, Font=Enum.Font.GothamBold, TextSize=14,
+        TextColor3=col, BackgroundTransparency=1,
+        Size=UDim2.new(0,36,1,0), Position=UDim2.new(1,xpos,0,0),
+        AutoButtonColor=false,
+    }, Titlebar); return b
+end
+local BtnClose = winBtn("✕", Th.Err, -36)
+local BtnMin   = winBtn("−", Th.Sub, -72)
+BtnClose.MouseButton1Click:Connect(function() Gui:Destroy() end)
+local minimized = false
+BtnMin.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    Root.Size = minimized and UDim2.new(0,840,0,38) or UDim2.new(0,840,0,570)
+end)
+
+-- Drag
+local dragging, dstart, dpos
+Titlebar.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging=true; dstart=i.Position; dpos=Root.Position
+    end
+end)
+UserInputSvc.InputChanged:Connect(function(i)
+    if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+        local d = i.Position - dstart
+        Root.Position = UDim2.new(dpos.X.Scale, dpos.X.Offset+d.X,
+                                   dpos.Y.Scale, dpos.Y.Offset+d.Y)
+    end
+end)
+UserInputSvc.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging=false end
+end)
+
+-- ── Tab Bar ───────────────────────────────────────────────────────
+local TabBar = mk("Frame",{
+    Size=UDim2.new(1,0,0,36), Position=UDim2.new(0,0,0,38),
+    BackgroundColor3=Th.Panel, BorderSizePixel=0,
+}, Root)
+pad(TabBar,4,8,4,8)
+list(TabBar, Enum.FillDirection.Horizontal, 4)
+
+local Content = mk("Frame",{
+    Size=UDim2.new(1,0,1,-74), Position=UDim2.new(0,0,0,74),
+    BackgroundTransparency=1, BorderSizePixel=0,
+}, Root)
+
+-- Tab factory
+local tabs, activeTab = {}, nil
+
+local function newTab(label, icon, order)
+    local btn = mk("TextButton",{
+        Text=icon.."  "..label, Font=Enum.Font.GothamSemibold, TextSize=12,
+        TextColor3=Th.Sub, BackgroundColor3=Th.Row1,
+        BackgroundTransparency=1, Size=UDim2.new(0,140,1,0),
+        LayoutOrder=order, AutoButtonColor=false,
+    }, TabBar); rnd(btn,5)
+
+    local panel = mk("Frame",{
+        Size=UDim2.new(1,0,1,0), BackgroundTransparency=1, Visible=false,
+    }, Content)
+
+    local t = {btn=btn, panel=panel}
+    tabs[label] = t
+
+    btn.MouseButton1Click:Connect(function()
+        if activeTab then
+            activeTab.btn.BackgroundTransparency=1
+            activeTab.btn.TextColor3=Th.Sub
+            activeTab.panel.Visible=false
+        end
+        activeTab=t
+        btn.BackgroundTransparency=0
+        btn.BackgroundColor3=Th.Accent
+        btn.TextColor3=Color3.new(1,1,1)
+        panel.Visible=true
+    end)
+    btn.MouseEnter:Connect(function()
+        if activeTab~=t then btn.BackgroundTransparency=0.75; btn.BackgroundColor3=Th.Accent end
+    end)
+    btn.MouseLeave:Connect(function()
+        if activeTab~=t then btn.BackgroundTransparency=1 end
+    end)
+    return t
+end
+
+-- ══════════════════════════════════════════════════════════════════
+-- TAB 1: DEX EXPLORER
+-- ══════════════════════════════════════════════════════════════════
+local DexT = newTab("Dex Explorer","🌳",1)
+local DP   = DexT.panel
+
+-- Tree panel (left)
+local TreePnl = mk("Frame",{
+    Size=UDim2.new(0,280,1,-8), Position=UDim2.new(0,4,0,4),
+    BackgroundColor3=Th.Panel, BorderSizePixel=0,
+}, DP); rnd(TreePnl); brd(TreePnl)
+
+local THead = mk("Frame",{
+    Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Header, BorderSizePixel=0,
+}, TreePnl); rnd(THead,6)
+mk("Frame",{Size=UDim2.new(1,0,0.5,0),Position=UDim2.new(0,0,0.5,0),
+    BackgroundColor3=Th.Header,BorderSizePixel=0},THead)
+mk("TextLabel",{
+    Text="  Instance Tree", Font=Enum.Font.GothamBold, TextSize=11,
+    TextColor3=Th.Sub, BackgroundTransparency=1,
+    Size=UDim2.new(1,0,1,0), TextXAlignment=Enum.TextXAlignment.Left,
+}, THead)
+
+local TreeScroll = mk("ScrollingFrame",{
+    Size=UDim2.new(1,0,1,-52), Position=UDim2.new(0,0,0,26),
+    BackgroundTransparency=1, ScrollBarThickness=4,
+    ScrollBarImageColor3=Th.Accent, CanvasSize=UDim2.new(0,0,0,0),
+    AutomaticCanvasSize=Enum.AutomaticSize.Y, BorderSizePixel=0,
+}, TreePnl)
+list(TreeScroll,_,2)
+
+-- Refresh
+local RefBtn = mk("TextButton",{
+    Text="↺  Refresh Tree", Font=Enum.Font.GothamSemibold, TextSize=11,
+    TextColor3=Color3.new(1,1,1), BackgroundColor3=Th.AccentDim,
+    Size=UDim2.new(1,-8,0,22), Position=UDim2.new(0,4,1,-26), BorderSizePixel=0,
+}, TreePnl); rnd(RefBtn,4)
+
+-- Properties panel (right)
+local PropPnl = mk("Frame",{
+    Size=UDim2.new(1,-292,1,-8), Position=UDim2.new(0,288,0,4),
+    BackgroundColor3=Th.Panel, BorderSizePixel=0,
+}, DP); rnd(PropPnl); brd(PropPnl)
+
+local PHd = mk("Frame",{
+    Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Header, BorderSizePixel=0,
+}, PropPnl); rnd(PHd,6)
+mk("Frame",{Size=UDim2.new(1,0,0.5,0),Position=UDim2.new(0,0,0.5,0),
+    BackgroundColor3=Th.Header,BorderSizePixel=0},PHd)
+local PropTitle = mk("TextLabel",{
+    Text="  Select an instance", Font=Enum.Font.GothamBold, TextSize=11,
+    TextColor3=Th.Sub, BackgroundTransparency=1,
+    Size=UDim2.new(1,0,1,0), TextXAlignment=Enum.TextXAlignment.Left,
+}, PHd)
+
+local PropScroll = mk("ScrollingFrame",{
+    Size=UDim2.new(1,0,1,-26), Position=UDim2.new(0,0,0,26),
+    BackgroundTransparency=1, ScrollBarThickness=4,
+    ScrollBarImageColor3=Th.Accent, CanvasSize=UDim2.new(0,0,0,0),
+    AutomaticCanvasSize=Enum.AutomaticSize.Y, BorderSizePixel=0,
+}, PropPnl)
+local PropLayout = list(PropScroll,_,1)
+
+local PROP_LIST = {
+    "Name","ClassName","Archivable",
+    "Size","Position","Rotation","CFrame","Anchored","CanCollide",
+    "Transparency","BrickColor","Color","Material","Locked","CastShadow",
+    "Source","Disabled","RunContext",
+    "Health","MaxHealth","WalkSpeed","JumpPower","HipHeight",
+    "Value","Text","MaxVisibleGraphemes",
+    "Velocity","AssemblyLinearVelocity",
+}
+
+local function renderProps(inst)
+    for _, c in ipairs(PropScroll:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+    PropTitle.Text = "  " .. inst.ClassName .. "  ·  " .. inst.Name
+    local row = 0
+    for _, prop in ipairs(PROP_LIST) do
+        local ok, val = pcall(function() return inst[prop] end)
+        if ok and val ~= nil then
+            row = row + 1
+            local tv = typeof(val)
+            local dv
+            if     tv=="Instance" then dv=val:GetFullName()
+            elseif tv=="CFrame"   then dv=("%.2f,%.2f,%.2f"):format(val.X,val.Y,val.Z)
+            elseif tv=="Vector3"  then dv=("%.2f,%.2f,%.2f"):format(val.X,val.Y,val.Z)
+            elseif tv=="Color3"   then dv=("RGB %d,%d,%d"):format(val.R*255,val.G*255,val.B*255)
+            else dv=tostring(val) end
+
+            local r = mk("Frame",{
+                Size=UDim2.new(1,0,0,22),
+                BackgroundColor3=row%2==0 and Th.Row1 or Th.Panel,
+                BorderSizePixel=0, LayoutOrder=row,
+            }, PropScroll)
+            mk("TextLabel",{
+                Text=" "..prop, Font=Enum.Font.Gotham, TextSize=11,
+                TextColor3=Th.Sub, BackgroundTransparency=1,
+                Size=UDim2.new(0.42,0,1,0), TextXAlignment=Enum.TextXAlignment.Left,
+            }, r)
+            mk("TextLabel",{
+                Text=dv, Font=Enum.Font.Gotham, TextSize=11,
+                TextColor3=Th.Text, BackgroundTransparency=1,
+                Size=UDim2.new(0.58,0,1,0), Position=UDim2.new(0.42,0,0,0),
+                TextXAlignment=Enum.TextXAlignment.Left,
+                TextTruncate=Enum.TextTruncate.AtEnd,
+            }, r)
+        end
+    end
+end
+
+local expanded = {}
+
+local ICONS = {
+    Part="🟫", MeshPart="🟫", Model="📦", Folder="📁",
+    Script="📜", LocalScript="📜", ModuleScript="📋",
+    RemoteEvent="📡", RemoteFunction="⚡", BindableEvent="🔔",
+    Player="👤", Humanoid="🧍", Tool="🔧", Workspace="🌐",
+    Sound="🔊", Decal="🖼️", SpecialMesh="⬡",
+}
+
+local function buildTree(inst, parent, depth)
+    depth = depth or 0
+    local ch = pcall(function()
+        return inst:GetChildren()
+    end) and inst:GetChildren() or {}
+
+    local hasKids = #ch > 0
+    local node = mk("Frame",{
+        Size=UDim2.new(1,0,0,0), BackgroundTransparency=1,
+        AutomaticSize=Enum.AutomaticSize.Y,
+    }, parent)
+    list(node,_,0)
+
+    local indent = depth * 14
+    local rowF = mk("Frame",{
+        Size=UDim2.new(1,0,0,22), BackgroundColor3=Color3.new(0,0,0),
+        BackgroundTransparency=1, BorderSizePixel=0,
+    }, node)
+
+    local arrowBtn = mk("TextButton",{
+        Text=hasKids and (expanded[inst] and "▼" or "▶") or " ",
+        Font=Enum.Font.Gotham, TextSize=9, TextColor3=Th.Sub,
+        BackgroundTransparency=1, Size=UDim2.new(0,14,1,0),
+        Position=UDim2.new(0,indent,0,0), AutoButtonColor=false,
+    }, rowF)
+
+    mk("TextLabel",{
+        Text=(ICONS[inst.ClassName] or "·").." "..inst.Name,
+        Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Text,
+        BackgroundTransparency=1,
+        Size=UDim2.new(1,-(indent+18),1,0), Position=UDim2.new(0,indent+16,0,0),
+        TextXAlignment=Enum.TextXAlignment.Left,
+        TextTruncate=Enum.TextTruncate.AtEnd,
+    }, rowF)
+
+    local rowClick = mk("TextButton",{
+        Text="",BackgroundTransparency=1,
+        Size=UDim2.new(1,0,1,0), AutoButtonColor=false,
+    }, rowF)
+
+    local kids = mk("Frame",{
+        Size=UDim2.new(1,0,0,0), BackgroundTransparency=1,
+        AutomaticSize=Enum.AutomaticSize.Y,
+        Visible=expanded[inst] or false,
+    }, node)
+    list(kids,_,0)
+
+    rowClick.MouseButton1Click:Connect(function()
+        renderProps(inst)
+    end)
+    rowClick.MouseEnter:Connect(function() rowF.BackgroundTransparency=0.85; rowF.BackgroundColor3=Th.Accent end)
+    rowClick.MouseLeave:Connect(function() rowF.BackgroundTransparency=1 end)
+
+    if hasKids then
+        local function toggle()
+            expanded[inst] = not expanded[inst]
+            kids.Visible = expanded[inst]
+            arrowBtn.Text = expanded[inst] and "▼" or "▶"
+            if expanded[inst] then
+                for _, c in ipairs(kids:GetChildren()) do
+                    if not c:IsA("UIListLayout") then c:Destroy() end
+                end
+                for _, child in ipairs(ch) do
+                    buildTree(child, kids, depth+1)
+                end
+            end
+        end
+        arrowBtn.MouseButton1Click:Connect(toggle)
+    end
+end
+
+local DEX_ROOTS = {
+    workspace,
+    Players,
+    game:GetService("ReplicatedStorage"),
+    game:GetService("ReplicatedFirst"),
+    game:GetService("StarterGui"),
+    game:GetService("StarterPack"),
+    game:GetService("Lighting"),
+    game:GetService("SoundService"),
+    game:GetService("Chat"),
+}
+
+local function populateTree()
+    for _, c in ipairs(TreeScroll:GetChildren()) do
+        if not c:IsA("UIListLayout") then c:Destroy() end
+    end
+    expanded = {}
+    for _, root in ipairs(DEX_ROOTS) do
+        pcall(buildTree, root, TreeScroll, 0)
+    end
+end
+
+populateTree()
+RefBtn.MouseButton1Click:Connect(populateTree)
+
+-- ══════════════════════════════════════════════════════════════════
+-- TAB 2: REMOTE SPY
+-- ══════════════════════════════════════════════════════════════════
+local SpyT = newTab("Remote Spy","📡",2)
+local SP   = SpyT.panel
+
+-- Controls
+local SpyCtrl = mk("Frame",{
+    Size=UDim2.new(1,-8,0,34), Position=UDim2.new(0,4,0,4),
+    BackgroundColor3=Th.Panel, BorderSizePixel=0,
+}, SP); rnd(SpyCtrl,6); brd(SpyCtrl)
+pad(SpyCtrl,4,8,4,8)
+list(SpyCtrl, Enum.FillDirection.Horizontal, 6, _, Enum.VerticalAlignment.Center)
+
+local function ctrlBtn(txt, bg)
+    local b=mk("TextButton",{
+        Text=txt, Font=Enum.Font.GothamSemibold, TextSize=11,
+        TextColor3=Color3.new(1,1,1), BackgroundColor3=bg,
+        Size=UDim2.new(0,96,0,24), BorderSizePixel=0, AutoButtonColor=false,
+    }, SpyCtrl); rnd(b,4); return b
+end
+local StartBtn = ctrlBtn("▶  Start", Th.Ok)
+local StopBtn  = ctrlBtn("■  Stop",  Th.Err)
+local ClrBtn   = ctrlBtn("🗑  Clear",Th.AccentDim)
+
+local SpyCntLbl = mk("TextLabel",{
+    Text="0 events", Font=Enum.Font.Gotham, TextSize=11,
+    TextColor3=Th.Sub, BackgroundTransparency=1,
+    Size=UDim2.new(1,-320,1,0), TextXAlignment=Enum.TextXAlignment.Right,
+}, SpyCtrl)
+
+-- Log
+local LogPnl = mk("Frame",{
+    Size=UDim2.new(0.5,-6,1,-50), Position=UDim2.new(0,4,0,42),
+    BackgroundColor3=Th.Panel, BorderSizePixel=0,
+}, SP); rnd(LogPnl); brd(LogPnl)
+
+local LHead = mk("Frame",{
+    Size=UDim2.new(1,0,0,24), BackgroundColor3=Th.Header, BorderSizePixel=0,
+}, LogPnl); rnd(LHead,6)
+mk("Frame",{Size=UDim2.new(1,0,0.5,0),Position=UDim2.new(0,0,0.5,0),
+    BackgroundColor3=Th.Header,BorderSizePixel=0},LHead)
+mk("TextLabel",{
+    Text="  Event Log", Font=Enum.Font.GothamBold, TextSize=11,
+    TextColor3=Th.Sub, BackgroundTransparency=1,
+    Size=UDim2.new(1,0,1,0), TextXAlignment=Enum.TextXAlignment.Left,
+}, LHead)
+
+local LogScroll = mk("ScrollingFrame",{
+    Size=UDim2.new(1,0,1,-24), Position=UDim2.new(0,0,0,24),
+    BackgroundTransparency=1, ScrollBarThickness=4,
+    ScrollBarImageColor3=Th.Accent, CanvasSize=UDim2.new(0,0,0,0),
+    AutomaticCanvasSize=Enum.AutomaticSize.Y, BorderSizePixel=0,
+}, LogPnl)
+list(LogScroll,_,1)
+
+-- Script Preview
+local PreviewPnl = mk("Frame",{
+    Size=UDim2.new(0.5,-6,1,-50), Position=UDim2.new(0.5,2,0,42),
+    BackgroundColor3=Th.Panel, BorderSizePixel=0,
+}, SP); rnd(PreviewPnl); brd(PreviewPnl)
+
+local PHead = mk("Frame",{
+    Size=UDim2.new(1,0,0,24), BackgroundColor3=Th.Header, BorderSizePixel=0,
+}, PreviewPnl); rnd(PHead,6)
+mk("Frame",{Size=UDim2.new(1,0,0.5,0),Position=UDim2.new(0,0,0.5,0),
+    BackgroundColor3=Th.Header,BorderSizePixel=0},PHead)
+mk("TextLabel",{
+    Text="  Generated Script", Font=Enum.Font.GothamBold, TextSize=11,
+    TextColor3=Th.Sub, BackgroundTransparency=1,
+    Size=UDim2.new(1,0,1,0), TextXAlignment=Enum.TextXAlignment.Left,
+}, PHead)
+
+local PreviewCode = mk("TextLabel",{
+    Text="-- Click a log entry to generate script",
+    Font=Enum.Font.Code, TextSize=11, TextColor3=Th.Sub,
+    BackgroundTransparency=1, Size=UDim2.new(1,-8,1,-62),
+    Position=UDim2.new(0,4,0,28),
+    TextXAlignment=Enum.TextXAlignment.Left,
+    TextYAlignment=Enum.TextYAlignment.Top,
+    TextWrapped=true,
+}, PreviewPnl)
+
+local function spyActionBtn(txt, bg, xp)
+    local b=mk("TextButton",{
+        Text=txt, Font=Enum.Font.GothamSemibold, TextSize=11,
+        TextColor3=Color3.new(1,1,1), BackgroundColor3=bg,
+        Size=UDim2.new(0.5,-4,0,26),
+        Position=UDim2.new(xp,xp==0 and 4 or 0,1,-30),
+        BorderSizePixel=0, AutoButtonColor=false,
+    }, PreviewPnl); rnd(b,4); return b
+end
+local SpyCopyBtn = spyActionBtn("Copy",        Th.Accent, 0)
+local SpyExecBtn = spyActionBtn("▶  Execute",  Th.Ok,     0.5)
+
+SpyCopyBtn.MouseButton1Click:Connect(function()
+    copyToClipboard(PreviewCode.Text)
+    SpyCopyBtn.Text="✓ Copied"
+    task.delay(1.5, function() SpyCopyBtn.Text="Copy" end)
+end)
+
+SpyExecBtn.MouseButton1Click:Connect(function()
+    local code = PreviewCode.Text
+    local fn, err = loadstring(code)
+    if fn then
+        local ok, e = pcall(fn)
+        SpyExecBtn.Text = ok and "✓ Done" or "✕ Error"
+        SpyExecBtn.BackgroundColor3 = ok and Th.AccentDim or Th.Err
+    else
+        SpyExecBtn.Text = "Syntax Err"
+        SpyExecBtn.BackgroundColor3 = Th.Err
+    end
+    task.delay(2, function()
+        SpyExecBtn.Text="▶  Execute"
+        SpyExecBtn.BackgroundColor3=Th.Ok
+    end)
+end)
+
+local logCount = 0
+local function addLogEntry(entry)
+    logCount = logCount + 1
+    SpyCntLbl.Text = logCount .. " events"
+
+    local row = mk("TextButton",{
+        Text="", BackgroundColor3=Th.Row1,
+        Size=UDim2.new(1,0,0,36),
+        BorderSizePixel=0, AutoButtonColor=false,
+        LayoutOrder=-logCount,
+    }, LogScroll); rnd(row,4)
+
+    local tc = entry.rtype == "RemoteEvent" and Th.Accent or Th.Warn
+    mk("Frame",{
+        Size=UDim2.new(0,3,0.65,0), Position=UDim2.new(0,0,0.175,0),
+        BackgroundColor3=tc, BorderSizePixel=0,
+    }, row)
+    mk("TextLabel",{
+        Text=entry.name, Font=Enum.Font.GothamBold, TextSize=11,
+        TextColor3=Th.Text, BackgroundTransparency=1,
+        Size=UDim2.new(1,-44,0,18), Position=UDim2.new(0,8,0,3),
+        TextXAlignment=Enum.TextXAlignment.Left,
+        TextTruncate=Enum.TextTruncate.AtEnd,
+    }, row)
+    mk("TextLabel",{
+        Text=entry.rtype=="RemoteEvent" and "RE" or "RF",
+        Font=Enum.Font.GothamBold, TextSize=9, TextColor3=tc,
+        BackgroundColor3=Color3.fromRGB(tc.R*50,tc.G*50,tc.B*50),
+        Size=UDim2.new(0,26,0,14), Position=UDim2.new(1,-32,0,5),
+        TextXAlignment=Enum.TextXAlignment.Center,
+    }, row)
+    mk("TextLabel",{
+        Text=entry.path:sub(1,55),
+        Font=Enum.Font.Gotham, TextSize=9, TextColor3=Th.Sub,
+        BackgroundTransparency=1,
+        Size=UDim2.new(1,-8,0,14), Position=UDim2.new(0,8,0,20),
+        TextXAlignment=Enum.TextXAlignment.Left,
+        TextTruncate=Enum.TextTruncate.AtEnd,
+    }, row)
+
+    row.MouseButton1Click:Connect(function()
+        for _, c in ipairs(LogScroll:GetChildren()) do
+            if c:IsA("TextButton") then c.BackgroundColor3=Th.Row1 end
+        end
+        row.BackgroundColor3 = Th.Row2
+        PreviewCode.Text     = RemoteSpy:BuildScript(entry)
+        PreviewCode.TextColor3 = Th.Text
+    end)
+    row.MouseEnter:Connect(function() row.BackgroundColor3=Th.Row2 end)
+    row.MouseLeave:Connect(function()
+        if PreviewCode.Text ~= "-- Click a log entry to generate script" then
+            -- keep highlight for selected
+        else
+            row.BackgroundColor3=Th.Row1
+        end
+    end)
+end
+
+table.insert(RemoteSpy.Callbacks, function(e) task.defer(addLogEntry, e) end)
+
+StartBtn.MouseButton1Click:Connect(function()
+    RemoteSpy:Start()
+    StartBtn.Text="● Spying"; StartBtn.BackgroundColor3=Color3.fromRGB(50,160,80)
+    SpyDot.BackgroundColor3=Th.Accent; SpyDotLbl.Text="SPY ON"; SpyDotLbl.TextColor3=Th.Accent
+end)
+StopBtn.MouseButton1Click:Connect(function()
+    RemoteSpy:Stop()
+    StartBtn.Text="▶  Start"; StartBtn.BackgroundColor3=Th.Ok
+    SpyDot.BackgroundColor3=Th.Sub; SpyDotLbl.Text="IDLE"; SpyDotLbl.TextColor3=Th.Sub
+end)
+ClrBtn.MouseButton1Click:Connect(function()
+    RemoteSpy:Clear()
+    for _, c in ipairs(LogScroll:GetChildren()) do
+        if c:IsA("TextButton") then c:Destroy() end
+    end
+    logCount=0; SpyCntLbl.Text="0 events"
+    PreviewCode.Text="-- Click a log entry to generate script"
+    PreviewCode.TextColor3=Th.Sub
+end)
+
+-- ══════════════════════════════════════════════════════════════════
+-- TAB 3: AI CHAT
+-- ══════════════════════════════════════════════════════════════════
+local AIT = newTab("AI Chat","🤖",3)
+local AIP = AIT.panel
+
+-- Provider bar
+local ProvBar = mk("Frame",{
+    Size=UDim2.new(1,-8,0,36), Position=UDim2.new(0,4,0,4),
+    BackgroundColor3=Th.Panel, BorderSizePixel=0,
+}, AIP); rnd(ProvBar,6); brd(ProvBar)
+pad(ProvBar,4,8,4,8)
+list(ProvBar, Enum.FillDirection.Horizontal, 6, _, Enum.VerticalAlignment.Center)
+
+mk("TextLabel",{
+    Text="Model:", Font=Enum.Font.GothamBold, TextSize=11,
+    TextColor3=Th.Sub, BackgroundTransparency=1,
+    Size=UDim2.new(0,48,1,0),
+}, ProvBar)
+
+local PROVIDERS = {
+    {id="pollinations", lbl="Pollinations (No Key)", model="openai"},
+    {id="openrouter",   lbl="OpenRouter :free",      model="deepseek/deepseek-r1:free"},
+    {id="groq",         lbl="Groq Llama",             model="llama-3.3-70b-versatile"},
+}
+local provBtns = {}
+
+for _, p in ipairs(PROVIDERS) do
+    local b=mk("TextButton",{
+        Text=p.lbl, Font=Enum.Font.GothamSemibold, TextSize=10,
+        TextColor3=Th.Sub, BackgroundColor3=Th.Row1,
+        Size=UDim2.new(0,170,0,26), BorderSizePixel=0, AutoButtonColor=false,
+    }, ProvBar); rnd(b,4); brd(b)
+    provBtns[p.id]=b
+    b.MouseButton1Click:Connect(function()
+        for _, pb in pairs(provBtns) do
+            pb.BackgroundColor3=Th.Row1; pb.TextColor3=Th.Sub
+        end
+        b.BackgroundColor3=Th.Accent; b.TextColor3=Color3.new(1,1,1)
+        AI.Provider=p.id; AI.Model=p.model
+    end)
+end
+-- default
+provBtns["pollinations"].BackgroundColor3=Th.Accent
+provBtns["pollinations"].TextColor3=Color3.new(1,1,1)
+
+local KeyInput = mk("TextBox",{
+    Text="", PlaceholderText="API Key (OpenRouter/Groq)",
+    Font=Enum.Font.Gotham, TextSize=10,
+    TextColor3=Th.Text, PlaceholderColor3=Th.Sub,
+    BackgroundColor3=Th.Row1, Size=UDim2.new(0,200,0,26),
+    BorderSizePixel=0, ClearTextOnFocus=false,
+    TextXAlignment=Enum.TextXAlignment.Left,
+}, ProvBar); rnd(KeyInput,4); brd(KeyInput); pad(KeyInput,4,6,4,6)
+KeyInput:GetPropertyChangedSignal("Text"):Connect(function() AI.APIKey=KeyInput.Text end)
+
+-- Chat scroll
+local ChatScroll = mk("ScrollingFrame",{
+    Size=UDim2.new(1,-8,1,-112), Position=UDim2.new(0,4,0,44),
+    BackgroundColor3=Th.Panel,
+    ScrollBarThickness=4, ScrollBarImageColor3=Th.Accent,
+    CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
+    BorderSizePixel=0,
+}, AIP); rnd(ChatScroll,6); brd(ChatScroll)
+list(ChatScroll,_,6)
+pad(ChatScroll,8,8,8,8)
+
+local msgIdx = 0
+
+-- Code block widget with Copy + Execute
+local function codeWidget(code, parent, lo)
+    local blk = mk("Frame",{
+        Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+        BackgroundColor3=Th.CodeBg, BorderSizePixel=0, LayoutOrder=lo,
+    }, parent); rnd(blk,6); brd(blk)
+
+    -- header
+    local hdr = mk("Frame",{
+        Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Header, BorderSizePixel=0,
+    }, blk); rnd(hdr,6)
+    mk("Frame",{Size=UDim2.new(1,0,0.5,0),Position=UDim2.new(0,0,0.5,0),
+        BackgroundColor3=Th.Header,BorderSizePixel=0},hdr)
+    mk("TextLabel",{
+        Text="  lua", Font=Enum.Font.GothamBold, TextSize=9,
+        TextColor3=Th.Sub, BackgroundTransparency=1,
+        Size=UDim2.new(0.5,0,1,0), TextXAlignment=Enum.TextXAlignment.Left,
+    }, hdr)
+
+    local btnRow = mk("Frame",{
+        Size=UDim2.new(0,130,1,0), Position=UDim2.new(1,-132,0,0),
+        BackgroundTransparency=1,
+    }, hdr)
+    pad(btnRow,3,4,3,0)
+    list(btnRow, Enum.FillDirection.Horizontal, 4, Enum.HorizontalAlignment.Right, Enum.VerticalAlignment.Center)
+
+    local function hBtn(txt, bg)
+        local b=mk("TextButton",{
+            Text=txt, Font=Enum.Font.GothamBold, TextSize=10,
+            TextColor3=Color3.new(1,1,1), BackgroundColor3=bg,
+            Size=UDim2.new(0,56,0,20), BorderSizePixel=0, AutoButtonColor=false,
+        }, btnRow); rnd(b,3); return b
+    end
+    local cpyB = hBtn("Copy",   Th.Accent)
+    local runB = hBtn("▶ Run",  Th.Ok)
+
+    cpyB.MouseButton1Click:Connect(function()
+        copyToClipboard(code)
+        cpyB.Text="✓"; task.delay(1.5, function() cpyB.Text="Copy" end)
+    end)
+    runB.MouseButton1Click:Connect(function()
+        local fn, err = loadstring(code)
+        if fn then
+            local ok, e = pcall(fn)
+            runB.Text = ok and "✓ Done" or "Error"
+            runB.BackgroundColor3 = ok and Th.AccentDim or Th.Err
+        else
+            runB.Text="Syntax"; runB.BackgroundColor3=Th.Err
+        end
+        task.delay(2, function() runB.Text="▶ Run"; runB.BackgroundColor3=Th.Ok end)
+    end)
+
+    mk("TextLabel",{
+        Text=code, Font=Enum.Font.Code, TextSize=11,
+        TextColor3=Color3.fromRGB(180,220,200), BackgroundTransparency=1,
+        Size=UDim2.new(1,-8,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+        Position=UDim2.new(0,4,0,28),
+        TextXAlignment=Enum.TextXAlignment.Left,
+        TextYAlignment=Enum.TextYAlignment.Top,
+        TextWrapped=true,
+    }, blk)
+end
+
+local function addChatMsg(role, text)
+    msgIdx = msgIdx + 1
+    local isUser = role == "user"
+
+    local outer = mk("Frame",{
+        Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+        BackgroundTransparency=1, LayoutOrder=msgIdx,
+    }, ChatScroll)
+
+    local bubble = mk("Frame",{
+        Size=UDim2.new(0.84,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+        Position=isUser and UDim2.new(0.16,0,0,0) or UDim2.new(0,0,0,0),
+        BackgroundColor3=isUser and Th.Accent or Th.Row1,
+        BorderSizePixel=0,
+    }, outer); rnd(bubble,8)
+    pad(bubble,8,10,8,10)
+    list(bubble,_,6)
+
+    if not isUser then
+        local blocks = AI:ParseBlocks(text)
+        for i, blk in ipairs(blocks) do
+            if blk.kind == "text" then
+                local t = blk.content:gsub("^%s+",""):gsub("%s+$","")
+                if t ~= "" then
+                    mk("TextLabel",{
+                        Text=t, Font=Enum.Font.Gotham, TextSize=11,
+                        TextColor3=Th.Text, BackgroundTransparency=1,
+                        Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+                        TextWrapped=true, TextXAlignment=Enum.TextXAlignment.Left,
+                        LayoutOrder=i,
+                    }, bubble)
+                end
+            else
+                codeWidget(blk.content:gsub("^%s+",""):gsub("%s+$",""), bubble, i)
+            end
+        end
+    else
+        mk("TextLabel",{
+            Text=text, Font=Enum.Font.Gotham, TextSize=11,
+            TextColor3=Color3.new(1,1,1), BackgroundTransparency=1,
+            Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+            TextWrapped=true, TextXAlignment=Enum.TextXAlignment.Left,
+            LayoutOrder=1,
+        }, bubble)
+    end
+
+    task.defer(function()
+        ChatScroll.CanvasPosition = Vector2.new(0, 1e6)
+    end)
+end
+
+-- Input bar
+local InputBar = mk("Frame",{
+    Size=UDim2.new(1,-8,0,62), Position=UDim2.new(0,4,1,-66),
+    BackgroundColor3=Th.Panel, BorderSizePixel=0,
+}, AIP); rnd(InputBar,6); brd(InputBar)
+pad(InputBar,6,6,6,6)
+
+local ChatIn = mk("TextBox",{
+    Text="", PlaceholderText="Ask AI to write a Roblox script...  (Enter to send)",
+    Font=Enum.Font.Gotham, TextSize=12,
+    TextColor3=Th.Text, PlaceholderColor3=Th.Sub,
+    BackgroundTransparency=1, ClearTextOnFocus=false,
+    Size=UDim2.new(1,-136,1,0), MultiLine=false,
+    TextXAlignment=Enum.TextXAlignment.Left,
+}, InputBar)
+
+local SendB = mk("TextButton",{
+    Text="Send ↵", Font=Enum.Font.GothamBold, TextSize=12,
+    TextColor3=Color3.new(1,1,1), BackgroundColor3=Th.Accent,
+    Size=UDim2.new(0,80,1,0), Position=UDim2.new(1,-82,0,0),
+    BorderSizePixel=0, AutoButtonColor=false,
+}, InputBar); rnd(SendB,6)
+
+local ClrChat = mk("TextButton",{
+    Text="🗑", Font=Enum.Font.GothamBold, TextSize=12,
+    TextColor3=Th.Sub, BackgroundTransparency=1,
+    Size=UDim2.new(0,24,1,0), Position=UDim2.new(1,-110,0,0),
+    BorderSizePixel=0,
+}, InputBar)
+
+local busy = false
+local function doSend()
+    if busy then return end
+    local msg = ChatIn.Text:match("^%s*(.-)%s*$")
+    if msg=="" then return end
+    ChatIn.Text=""; busy=true
+    SendB.Text="..."; SendB.BackgroundColor3=Th.AccentDim
+    addChatMsg("user", msg)
+    AI:Send(msg, function(reply, err)
+        busy=false
+        SendB.Text="Send ↵"; SendB.BackgroundColor3=Th.Accent
+        addChatMsg("assistant", err and ("⚠️ "..err) or reply)
+    end)
+end
+
+SendB.MouseButton1Click:Connect(doSend)
+ChatIn.FocusLost:Connect(function(enter) if enter then doSend() end end)
+ClrChat.MouseButton1Click:Connect(function()
+    AI:ClearHistory()
+    for _,c in ipairs(ChatScroll:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+    msgIdx=0
+end)
+
+-- Welcome msg
+addChatMsg("assistant",[[Hey baker. Roblox scripting AI online — powered by Pollinations (no key needed).
+
+Ask me anything:
+```lua
+-- Example: ESP script (paste prompt below)
+-- "write me a player ESP with boxes"
+-- "make a RemoteEvent fire spam loop"
+-- "speed hack 100 walkspeed"
+```
+Every script I write gets Copy + Execute buttons.
+Switch providers in the bar above for OpenRouter/Groq free tiers.]])
+
+-- ══════════════════════════════════════════════════════════════════
+-- TAB 4: DELTA SYNC
+-- ══════════════════════════════════════════════════════════════════
+local SyncT = newTab("Delta Sync","⚡",4)
+local SYP   = SyncT.panel
+
+DeltaSync:Init()
+
+local SyncMain = mk("Frame",{
+    Size=UDim2.new(1,-8,1,-8), Position=UDim2.new(0,4,0,4),
+    BackgroundColor3=Th.Panel, BorderSizePixel=0,
+}, SYP); rnd(SyncMain,6); brd(SyncMain)
+pad(SyncMain,12,12,12,12)
+list(SyncMain,_,10)
+
+mk("TextLabel",{
+    Text="⚡  Delta Sync — write scripts to DEXED_Sync/ for Delta file-sync",
+    Font=Enum.Font.GothamBold, TextSize=13,
+    TextColor3=Th.Text, BackgroundTransparency=1,
+    Size=UDim2.new(1,0,0,20), TextXAlignment=Enum.TextXAlignment.Left,
+    LayoutOrder=0,
+}, SyncMain)
+
+mk("TextLabel",{
+    Text="In Delta executor → Scripts → File Sync → point to workspace/DEXED_Sync/",
+    Font=Enum.Font.Gotham, TextSize=10,
+    TextColor3=Th.Sub, BackgroundTransparency=1,
+    Size=UDim2.new(1,0,0,16), TextXAlignment=Enum.TextXAlignment.Left,
+    LayoutOrder=1,
+}, SyncMain)
+
+local SNameIn = mk("TextBox",{
+    Text="my_script", PlaceholderText="Script name (without .lua)",
+    Font=Enum.Font.Gotham, TextSize=12,
+    TextColor3=Th.Text, PlaceholderColor3=Th.Sub,
+    BackgroundColor3=Th.Row1, Size=UDim2.new(1,0,0,32),
+    BorderSizePixel=0, ClearTextOnFocus=false,
+    TextXAlignment=Enum.TextXAlignment.Left, LayoutOrder=2,
+}, SyncMain); rnd(SNameIn,4); brd(SNameIn); pad(SNameIn,6,8,6,8)
+
+local SCodeIn = mk("TextBox",{
+    Text='-- paste or write your script here\nprint("DEXED Sync active!")',
+    Font=Enum.Font.Code, TextSize=11,
+    TextColor3=Th.Text, BackgroundColor3=Th.CodeBg,
+    Size=UDim2.new(1,0,0,220), BorderSizePixel=0,
+    ClearTextOnFocus=false, MultiLine=true,
+    TextXAlignment=Enum.TextXAlignment.Left,
+    TextYAlignment=Enum.TextYAlignment.Top,
+    LayoutOrder=3,
+}, SyncMain); rnd(SCodeIn,4); brd(SCodeIn); pad(SCodeIn,8,8,8,8)
+
+local SBtnRow = mk("Frame",{
+    Size=UDim2.new(1,0,0,30), BackgroundTransparency=1, LayoutOrder=4,
+}, SyncMain)
+list(SBtnRow, Enum.FillDirection.Horizontal, 8, _, Enum.VerticalAlignment.Center)
+
+local function sBtn(txt, bg)
+    local b=mk("TextButton",{
+        Text=txt, Font=Enum.Font.GothamSemibold, TextSize=11,
+        TextColor3=Color3.new(1,1,1), BackgroundColor3=bg,
+        Size=UDim2.new(0,118,0,28), BorderSizePixel=0, AutoButtonColor=false,
+    }, SBtnRow); rnd(b,4); return b
+end
+local PushB = sBtn("⬆  Push to File", Th.Accent)
+local PullB = sBtn("⬇  Pull from File",Th.AccentDim)
+local RunSB = sBtn("▶  Execute",       Th.Ok)
+local CpySB = sBtn("Copy",             Th.Row2)
+
+local SStatusLbl = mk("TextLabel",{
+    Text="", Font=Enum.Font.GothamSemibold, TextSize=11,
+    TextColor3=Th.Ok, BackgroundTransparency=1,
+    Size=UDim2.new(1,0,0,18), TextXAlignment=Enum.TextXAlignment.Left,
+    LayoutOrder=5,
+}, SyncMain)
+
+local SLogScroll = mk("ScrollingFrame",{
+    Size=UDim2.new(1,0,0,100), BackgroundColor3=Th.CodeBg,
+    ScrollBarThickness=3, ScrollBarImageColor3=Th.Accent,
+    CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
+    BorderSizePixel=0, LayoutOrder=6,
+}, SyncMain); rnd(SLogScroll,4); brd(SLogScroll)
+list(SLogScroll,_,2)
+pad(SLogScroll,4,4,4,4)
+
+local slogN=0
+local function slog(msg, col)
+    slogN=slogN+1
+    mk("TextLabel",{
+        Text="["..os.date("%H:%M:%S").."] "..msg,
+        Font=Enum.Font.Code, TextSize=10,
+        TextColor3=col or Th.Text, BackgroundTransparency=1,
+        Size=UDim2.new(1,0,0,14), TextXAlignment=Enum.TextXAlignment.Left,
+        LayoutOrder=slogN,
+    }, SLogScroll)
+    task.defer(function()
+        SLogScroll.CanvasPosition = Vector2.new(0, 1e6)
+    end)
+end
+
+PushB.MouseButton1Click:Connect(function()
+    local name = SNameIn.Text:gsub("%.lua$","")
+    local code = SCodeIn.Text
+    if name=="" or code=="" then slog("Empty name or code.", Th.Err); return end
+    local ok, result = DeltaSync:Push(name, code)
+    if ok then
+        slog("Pushed → "..result, Th.Ok)
+        SStatusLbl.Text="✓ Synced: "..result
+        SStatusLbl.TextColor3=Th.Ok
+    else
+        slog("Push failed: "..result, Th.Err)
+        SStatusLbl.Text="✕ "..result
+        SStatusLbl.TextColor3=Th.Err
+    end
+end)
+
+PullB.MouseButton1Click:Connect(function()
+    local name = SNameIn.Text:gsub("%.lua$","")
+    local content = DeltaSync:Pull(name)
+    if content then
+        SCodeIn.Text=content
+        slog("Pulled ← DEXED_Sync/"..name..".lua", Th.Accent)
+        SStatusLbl.Text="✓ Pulled"; SStatusLbl.TextColor3=Th.Accent
+    else
+        slog("Not found: DEXED_Sync/"..name..".lua", Th.Err)
+        SStatusLbl.Text="✕ File not found"; SStatusLbl.TextColor3=Th.Err
+    end
+end)
+
+RunSB.MouseButton1Click:Connect(function()
+    local fn, err = loadstring(SCodeIn.Text)
+    if fn then
+        local ok, e = pcall(fn)
+        slog(ok and "Executed OK." or "Runtime: "..tostring(e), ok and Th.Ok or Th.Err)
+    else
+        slog("Syntax: "..tostring(err), Th.Err)
+    end
+end)
+
+CpySB.MouseButton1Click:Connect(function()
+    copyToClipboard(SCodeIn.Text)
+    CpySB.Text="✓ Copied"
+    task.delay(1.5, function() CpySB.Text="Copy" end)
+end)
+
+slog("Sync folder ready: DEXED_Sync/", Th.Accent)
+slog("writefile support: "..tostring(writefile ~= nil), writefile and Th.Ok or Th.Warn)
+slog("HTTP support:      "..tostring(
+    (syn and syn.request)~=nil or request~=nil or http_request~=nil
+), Th.Ok)
+
+-- ══ Activate default tab ══════════════════════════════════════════
+tabs["Dex Explorer"].btn.BackgroundTransparency=0
+tabs["Dex Explorer"].btn.BackgroundColor3=Th.Accent
+tabs["Dex Explorer"].btn.TextColor3=Color3.new(1,1,1)
+tabs["Dex Explorer"].panel.Visible=true
+activeTab = tabs["Dex Explorer"]
+
+SpyDot.BackgroundColor3 = Th.Ok
+SpyDotLbl.Text = "READY"
+SpyDotLbl.TextColor3 = Th.Ok
